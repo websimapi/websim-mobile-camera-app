@@ -11,16 +11,13 @@ const downloadLinksContainer = document.getElementById('downloadLinks');
 const imageOutputContainer = document.getElementById('imageOutput');
 const videoOutputContainer = document.getElementById('videoOutput');
 
-
 let stream = null;
 let mediaRecorder = null;
 let recordedChunks = [];
+let currentFacingMode = 'environment'; // To keep track of preferred facing mode
 
 // --- Sound Effects ---
 let audioContext;
-const shutterSoundBuffer = null; // We'll load this later if needed
-const recordStartSoundBuffer = null;
-const recordStopSoundBuffer = null;
 
 function getAudioContext() {
     if (!audioContext) {
@@ -29,76 +26,128 @@ function getAudioContext() {
     return audioContext;
 }
 
-async function playSound(buffer) {
-    if (!buffer || !audioContext) return;
-    const source = audioContext.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioContext.destination);
-    source.start(0);
+// --- Camera Error Handling ---
+function handleCameraError(err) {
+    console.error("Error accessing camera:", err.name, err.message, err); // Full error to console
+    let alertMessage = "Could not access camera. Please ensure permissions are granted and try again.\n\n";
+    alertMessage += `Error: ${err.name}\n`;
+
+    switch (err.name) {
+        case "NotAllowedError": // Standard
+        case "PermissionDeniedError": // Older browsers
+            alertMessage += "Permission to access the camera and/or microphone was denied. Please check your browser and system settings to allow access for this page/site.";
+            break;
+        case "NotFoundError": // Standard
+        case "DevicesNotFoundError": // Older browsers
+            alertMessage += "No camera and/or microphone was found. Please ensure one is connected and enabled. If you have multiple cameras, the preferred one ('rear camera') might not be available.";
+            break;
+        case "NotReadableError": // Standard
+        case "TrackStartError": // Older browsers
+            alertMessage += "The camera and/or microphone could not be started. It might be in use by another application, or there could be a hardware error. Try closing other apps or browser tabs that might be using the camera/microphone.";
+            break;
+        case "OverconstrainedError": // Standard
+            alertMessage += `The camera does not support the requested settings (e.g., resolution, 'rear camera' preference). Your device might not have a camera that matches these requirements. Error: ${err.message}`;
+            break;
+        case "SecurityError": // Standard
+            alertMessage += "Access to the camera and/or microphone is not allowed from this page. This might be due to security settings in your browser or operating system, or because the page is not loaded over a secure connection (HTTPS). Ensure the page is loaded securely (https://).";
+            break;
+        case "TypeError": // Standard (e.g. constraints object malformed)
+            alertMessage += "There was a technical issue with the camera request (e.g., invalid settings). This might be a bug in the application.";
+            break;
+        default:
+            alertMessage += `An unexpected error occurred: ${err.message}. Check the browser console for more details.`;
+    }
+    
+    alert(alertMessage);
+
+    // Reset UI to reflect camera failed/stopped state
+    startCameraBtn.textContent = 'Start Camera';
+    takePictureBtn.disabled = true;
+    startRecordBtn.disabled = true;
+    stopRecordBtn.disabled = true;
+    videoElement.style.display = 'none';
+    videoElement.srcObject = null; // Clear the srcObject
+    if (stream) {
+        stream.getTracks().forEach(track => track.stop()); // Ensure all tracks are stopped
+        stream = null;
+    }
 }
-
-// Example: Load a sound (replace with actual sound loading if you add assets)
-// async function loadSound(url) {
-//     if (!getAudioContext()) return null;
-//     try {
-//         const response = await fetch(url);
-//         const arrayBuffer = await response.arrayBuffer();
-//         return await audioContext.decodeAudioData(arrayBuffer);
-//     } catch (error) {
-//         console.error(`Error loading sound: ${url}`, error);
-//         return null;
-//     }
-// }
-
-// async function initSounds() {
-//     shutterSoundBuffer = await loadSound('path/to/shutter.mp3');
-//     recordStartSoundBuffer = await loadSound('path/to/record_start.mp3');
-//     recordStopSoundBuffer = await loadSound('path/to/record_stop.mp3');
-// }
-// initSounds(); // Call this if you add sound assets
 
 // --- Camera Logic ---
 startCameraBtn.addEventListener('click', async () => {
-    try {
-        if (stream) { // Stop existing stream if any
-            stream.getTracks().forEach(track => track.stop());
-        }
-        stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-                facingMode: 'environment' // Prioritize rear camera
-            },
-            audio: true // Request audio for recording
-        });
-        videoElement.srcObject = stream;
-        videoElement.style.display = 'block';
+    getAudioContext(); // Initialize AudioContext on user gesture, if not already.
 
-        startCameraBtn.textContent = 'Switch Camera'; // Or Stop Camera
-        takePictureBtn.disabled = false;
-        startRecordBtn.disabled = false;
-        stopRecordBtn.disabled = true; // Stop recording is disabled until recording starts
-
-        // Reset UI elements
-        imgElement.style.display = 'none';
-        imgElement.src = '#';
-        clearDownloadLinks();
-        videoOutputContainer.innerHTML = '<p>Last Video Recorded:</p>';
-
-
-    } catch (err) {
-        console.error("Error accessing camera:", err);
-        alert("Could not access camera. Please ensure permissions are granted and try again. Error: " + err.message);
+    if (stream) { // If stream exists, this button now acts as "Stop Camera"
+        stream.getTracks().forEach(track => track.stop());
+        videoElement.srcObject = null;
+        videoElement.style.display = 'none';
+        stream = null;
+        
+        startCameraBtn.textContent = 'Start Camera';
         takePictureBtn.disabled = true;
         startRecordBtn.disabled = true;
         stopRecordBtn.disabled = true;
-    }
-});
-
-takePictureBtn.addEventListener('click', () => {
-    if (!stream || !stream.active) {
-        alert("Camera not active.");
+        
+        // Reset media outputs
+        imgElement.style.display = 'none';
+        imgElement.src = '#';
+        clearDownloadLinks();
+        videoOutputContainer.innerHTML = '<p>Last Video Recorded:</p>'; // Clear previous video preview
         return;
     }
-    // await playSound(shutterSoundBuffer); // Play shutter sound
+
+    // If no stream, try to start it
+    try {
+        // Attempt to get stream with preferred facing mode
+        stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                facingMode: currentFacingMode
+            },
+            audio: true // Request audio for recording capabilities
+        });
+    } catch (err) {
+        // If initial attempt fails (e.g. OverconstrainedError for facingMode), try fallback
+        if (err.name === "OverconstrainedError" || err.name === "NotFoundError") {
+            console.warn(`getUserMedia failed with facingMode '${currentFacingMode}'. Trying default video device.`);
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: true, // Let browser pick camera
+                    audio: true
+                });
+                // If successful with fallback, update currentFacingMode if knowable, or assume 'user'
+                // For simplicity, we won't try to guess which camera was chosen by fallback.
+            } catch (fallbackErr) {
+                handleCameraError(fallbackErr); // Handle error from fallback attempt
+                return;
+            }
+        } else {
+            handleCameraError(err); // Handle other errors from initial attempt
+            return;
+        }
+    }
+
+    videoElement.srcObject = stream;
+    videoElement.style.display = 'block';
+    // videoElement.play() often not needed due to autoplay, but can be added if issues arise.
+
+    startCameraBtn.textContent = 'Stop Camera'; 
+    takePictureBtn.disabled = false;
+    startRecordBtn.disabled = false;
+    stopRecordBtn.disabled = true; // Stop recording is disabled until recording starts
+
+    // Reset UI elements for new session
+    imgElement.style.display = 'none';
+    imgElement.src = '#';
+    clearDownloadLinks();
+    videoOutputContainer.innerHTML = '<p>Last Video Recorded:</p>';
+
+});
+
+takePictureBtn.addEventListener('click', async () => {
+    if (!stream || !stream.active) {
+        alert("Camera not active. Please start the camera first.");
+        return;
+    }
 
     canvasElement.width = videoElement.videoWidth;
     canvasElement.height = videoElement.videoHeight;
@@ -113,16 +162,15 @@ takePictureBtn.addEventListener('click', () => {
     createDownloadLink(dataUrl, 'picture.png', 'image/png', 'image');
 });
 
-startRecordBtn.addEventListener('click', () => {
+startRecordBtn.addEventListener('click', async () => {
     if (!stream || !stream.active) {
-        alert("Camera not active.");
+        alert("Camera not active. Please start the camera first.");
         return;
     }
     if (mediaRecorder && mediaRecorder.state === 'recording') {
         alert("Already recording.");
         return;
     }
-    // await playSound(recordStartSoundBuffer);
 
     recordedChunks = [];
     const options = { mimeType: 'video/webm; codecs=vp9,opus' }; // Prioritize webm with vp9/opus for wide compatibility
@@ -179,10 +227,9 @@ startRecordBtn.addEventListener('click', () => {
     stopRecordBtn.disabled = false;
 });
 
-stopRecordBtn.addEventListener('click', () => {
+stopRecordBtn.addEventListener('click', async () => {
     if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
-        // await playSound(recordStopSoundBuffer);
         // UI updates are handled in mediaRecorder.onstop
     } else {
         // This case should ideally not be reachable if buttons are managed correctly
@@ -228,5 +275,3 @@ function setInitialState() {
 
 // Initialize
 setInitialState();
-// getAudioContext(); // Initialize AudioContext on user interaction if preferred, or here
-
